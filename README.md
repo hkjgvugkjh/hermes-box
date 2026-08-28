@@ -1,13 +1,16 @@
-# Hermes Studio 小方盒 — 完整项目文档
+# Hermes Studio 小方盒 — 完整项目
 
 ## 📋 项目概述
 
 **Hermes 小方盒** 是基于 ESP32 开源硬件的语音助手方案，通过 Socket.IO 协议连接 [Hermes Studio](https://github.com/EKKOLearnAI/hermes-studio) 网关，实现语音对话、音频播放、环境监测等功能。
 
-本项目包含：
-- **hermes-device** — 独立协议库（C++ header-only）
-- **hermes-t5** — LilyGO T5 2.13" E-Paper 墨水屏版本
-- **hermes-xrs** — ESP32-S3 + SPI TFT 彩屏版本（"学而思 ESP32版"）
+本项目包含三个独立子项目：
+
+| 子项目 | 说明 | 版本 |
+|--------|------|------|
+| [hermes-device](hermes-device/) | 独立协议库 (C++ header-only) | v1.0.0 |
+| [hermes-t5](hermes-t5/) | LilyGO T5 2.13" E-Paper 墨水屏版本 | v2.2 |
+| [hermes-xrs](hermes-xrs/) | ESP32-S3 + SPI TFT 彩屏版本 | v2.2 |
 
 ---
 
@@ -17,26 +20,25 @@
 hermes-box/
 ├── hermes-device/              # 📦 独立协议库
 │   ├── src/
-│   │   ├── hermes-device.h     # 库头文件
-│   │   └── hermes-device.cpp   # 库实现
+│   │   ├── hermes-device.h     # 库头文件 (~450行)
+│   │   └── hermes-device.cpp   # 库实现 (~1150行)
 │   ├── library.properties      # Arduino Library 配置
-│   ├── docs/                   # 协议文档
 │   └── README.md
 │
 ├── hermes-t5/                  # 🖥️ 墨水屏版本
-│   ├── src/main.cpp            # T5 固件 (~2200行)
+│   ├── src/main.cpp            # T5 固件 (~2295行)
 │   ├── platformio.ini          # PlatformIO 配置
 │   ├── partitions.csv          # 分区表
 │   └── README.md
 │
-├── hermes-xrs/                 # 📱 彩屏版本 (学而思 ESP32版)
+├── hermes-xrs/                 # 📱 彩屏版本
 │   ├── src/
-│   │   ├── main.cpp            # XRS 固件
+│   │   ├── main.cpp            # XRS 固件 (~2207行)
 │   │   └── config.h            # 引脚配置
 │   ├── platformio.ini
 │   └── README.md
 │
-└── 20260828-Hermes小方盒连接协议研究.txt  # 协议研究报告
+└── .gitmodules                 # Git 子模块配置
 ```
 
 ---
@@ -267,16 +269,26 @@ void loop() {
 
 ```cpp
 // 初始化
-void begin(const String& deviceName, const String& deviceType = "global_agent");
+void begin(const String& deviceName = "HStudio-Device", 
+           const String& deviceType = "global_agent",
+           const String& namespaceName = "/global-agent");
 
 // WiFi
-bool connectWifi(const String& ssid, const String& pass);
+bool connectWifi(const String& ssid, const String& pass, bool save = true);
 bool connectSavedWifi();
-void startSetupAp(const String& ssid);
+void disconnectWifi();
+bool isWifiConnected() const;
+void startSetupAp(const String& ssid, const String& password = "");
+
+// 网关发现
+String discoverGateway();
+bool testGateway(const String& ip);
+void setGatewayUrl(const String& url);
 
 // 认证
 bool login(const String& account, const String& password, const String& profile);
 void logout();
+bool isAuthenticated() const;
 
 // 语音交互
 bool startVoiceInteraction(const String& interactionId);
@@ -284,7 +296,8 @@ bool sendVoiceChunk(const String& interactionId, const uint8_t* data, size_t len
 bool endVoiceInteraction(const String& interactionId, uint32_t totalBytes);
 
 // 状态上报
-void reportStatus(const String& interactionId, const String& status, bool audioPlaying, uint32_t queueLength);
+void reportStatus(const String& interactionId = "", const String& status = "", 
+                  bool audioPlaying = false, uint32_t queueLength = 0);
 void reportReady();
 
 // 闹钟
@@ -295,6 +308,7 @@ void toggleAlarm(uint8_t index, bool enabled);
 // 定时器
 void startTimer(uint32_t seconds);
 void stopTimer();
+bool isTimerRunning() const;
 uint32_t getTimerRemaining() const;
 
 // 传感器
@@ -317,6 +331,7 @@ void loop();
    - 必须发送 HTTP WebSocket 升级请求
    - 等待 `101 Switching Protocols` 响应
    - 响应读取到空行 (`\r\n\r\n`) 为止
+   - 等待 hello 包 (0{...}) 后再发送 namespace connect
 
 2. **Socket.IO 认证**
    - 每个事件 JSON 必须包含 `apiToken` 字段
@@ -366,6 +381,8 @@ avahi-browse -r _http._tcp
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| v2.2 | 2026-08-28 | 修复 Engine.IO 握手、auth.invalid 处理、namespace 错误处理 |
+| v2.1 | 2026-08-28 | 修复 WebSocket 握手、添加连接失败检测 |
 | v2.0 | 2026-08-28 | 完整功能：语音、时钟、天气、传感器、闹钟、定时器 |
 | v1.0 | 2026-08-27 | 基础功能：语音对话、WiFi 配网 |
 
