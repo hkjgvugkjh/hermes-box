@@ -40,7 +40,7 @@
 #include <esp_system.h>
 #include <esp_rom_sys.h>
 #include <vector>
-#include <memory>
+#include <ESPmDNS.h>
 
 #include "config.h"
 
@@ -58,6 +58,7 @@ SPIClass hspi(VSPI);  // 使用 VSPI (SPI2) 用于 SD 卡
 bool wifiReady = false;
 bool setupApMode = false;
 String savedSsid;
+String savedAccount;
 String savedPass;
 
 // 设备状态
@@ -298,25 +299,7 @@ int jsonIntValue(const String &json, const String &key) {
 // TFT 显示系统
 // ============================================================
 
-enum class DisplayMode : uint8_t {
-  Boot,
-  WifiSetup,
-  WifiConnecting,
-  Login,
-  Ready,
-  Think,
-  Listen,
-  Play,
-  Error,
-  Clock,
-  Weather,
-  Sensors,
-  Music,
-  Notification,
-  Menu,
-  Timer,
-  Alarm
-};
+
 
 DisplayMode currentDisplayMode = DisplayMode::Boot;
 String displayLine1 = "";
@@ -1827,14 +1810,14 @@ void handleRoot() {
     if (mcuAuthToken.length() == 0) {
       html += "<h2>Login to Hermes Studio</h2>";
       html += "<form method='post' action='/login'>";
-      html += "<input type='text' name='account' placeholder='Account' required>";
+      html += "<input type='text' name='account' placeholder='Account' value='" + htmlEscape(savedAccount) + "' required>";
       html += "<input type='password' name='password' placeholder='Password' required>";
       String defaultUrl = discoveredGatewayUrl;
       if (defaultUrl.length() == 0) {
         defaultUrl = "http://" + WiFi.localIP().toString();
       }
       html += "<input type='text' name='url' placeholder='Studio URL (http://...)' value='" + defaultUrl + "' required>";
-      html += "<input type='text' name='profile' placeholder='Profile name' required>";
+      html += "<input type='text' name='profile' placeholder='Profile name' value='" + htmlEscape(selectedProfile) + "' required>";
       html += "<button type='submit'>Login</button></form>";
     } else {
       html += "<p style='color:green'>Connected to Hermes Studio</p>";
@@ -1935,7 +1918,7 @@ void handleLogin() {
 void handleLogout() {
   mcuAuthToken = "";
   mcuSocketRelayUrl = "";
-  selectedProfile = "";
+  // Keep selectedProfile - don't clear it
   disconnectMcuSocketClient();
   
   prefs.begin("mcu", false);
@@ -2072,7 +2055,9 @@ void setup() {
   mcuAuthToken = prefs.getString("auth_token", "");
   activeDeviceUrl = prefs.getString("active_url", "");
   mcuSocketRelayUrl = prefs.getString("relay_url", "");
-  selectedProfile = prefs.getString("cur_profile", "");
+  selectedProfile = prefs.getString("cur_profile", "default");
+  savedAccount = prefs.getString("cur_account", "");
+  if (selectedProfile.length() == 0) selectedProfile = "default";
   prefs.end();
   
   // 加载闹钟
