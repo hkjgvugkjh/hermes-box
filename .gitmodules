@@ -1,0 +1,9 @@
+[submodule "hermes-device"]
+	path = hermes-device
+	url = https://github.com/hkjgvugkjh/hermes-device.git
+[submodule "hermes-t5"]
+	path = hermes-t5
+	url = https://github.com/hkjgvugkjh/hermes-t5.git
+[submodule "hermes-xrs"]
+	path = hermes-xrs
+	url = https://github.com/hkjgvugkjh/hermes-xrs.git
