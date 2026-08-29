@@ -1,0 +1,411 @@
+# Hermes 小方盒连接协议研究报告
+
+> 研究日期：2026-08-28
+> 数据来源：Hermes Agent 源码 (v0.6.44)、Hermes Studio API、官方文档
+
+---
+
+## 一、协议架构总览
+
+Hermes 小方盒（LAN/Remote Device）的连接体系是一个**多层协议栈**，从底层到应用层依次为：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  应用层：Devices API / App Connections / Terminal / File Xfer │
+├─────────────────────────────────────────────────────────────┤
+│  传输层：WebSocket (ws/wss) + HTTP REST                      │
+├─────────────────────────────────────────────────────────────┤
+│  安全层：HMAC-SHA256 签名 + Bearer Token + Nonce 防重放       │
+├─────────────────────────────────────────────────────────────┤
+│  网络层：LAN 发现 (mDNS/Bonjour) + TCP 直连 / 云中继           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 二、设备发现与配对协议（Devices API）
+
+### 2.1 设备发现
+
+**API 端点：**
+- `POST /api/devices/scan` — 刷新 LAN 设备发现缓存
+- `GET /api/devices` — 列出已知 LAN 和远程设备
+
+**发现机制：**
+- 基于 mDNS/Bonjour 局域网广播
+- 设备缓存包含配对状态和在线状态
+- 支持 LAN（局域网）和 Remote（远程）两种设备类型
+
+### 2.2 设备配对流程
+
+**核心 API 端点：**
+```
+POST /api/devices/link-request      — 发起配对请求（含 nonce + signature）
+POST /api/devices/link-status       — 查询配对状态
+GET  /api/devices/pairing-link      — 获取配对链接
+GET  /api/devices/link-info         — 获取链接信息
+POST /api/devices/manual-request    — 手动配对请求（通过 URL）
+POST /api/devices/{id}/request      — 通过配对码请求配对
+POST /api/devices/{id}/approve      — 批准配对
+POST /api/devices/{id}/reject       — 拒绝配对
+POST /api/devices/{id}/block        — 阻止设备
+POST /api/devices/{id}/unblock      — 解除阻止
+```
+
+**配对协议字段：**
+```json
+{
+  "nonce": "string",           // 随机数，防重放攻击
+  "signature": "string",       // HMAC-SHA256 签名
+  "device_id": "string",       // 设备唯一标识
+  "device_public_key": "string", // 设备公钥
+  "pairing_code": "string"     // 配对码（短码）
+}
+```
+
+**配对流程：**
+1. 设备广播自身存在（mDNS）
+2. Web UI 通过 `scan` 发现设备
+3. 用户选择设备，发送 `link-request`（含 nonce + signature）
+4. 设备返回 `device_public_key`
+5. 双方通过 ECDH 协商会话密钥
+6. Web UI 通过 `approve` 完成配对
+
+### 2.3 安全特性
+
+| 特性 | 实现 |
+|------|------|
+| 防重放 | Nonce + 时间戳 |
+| 身份验证 | HMAC-SHA256 签名 |
+| 密钥交换 | ECDH（椭圆曲线 Diffie-Hellman） |
+| 数据加密 | AES-128-GCM |
+| 配对码 | 8字符，32字符无歧义字母表 |
+| 配对码有效期 | 1小时 |
+| 速率限制 | 每用户每10分钟1次 |
+| 锁定机制 | 5次失败后锁定1小时 |
+
+---
+
+## 三、LAN Peer 连接协议（WebSocket）
+
+### 3.1 连接建立
+
+**API 端点：**
+```
+POST /api/devices/{id}/connect                    — 连接设备
+GET  /api/devices/peer-connections                — 列出活动连接
+POST /api/devices/peer-connections/{id}/disconnect — 断开连接
+```
+
+**WebSocket 连接参数：**
+```json
+{
+  "device_id": "string",
+  "profile": "string",
+  "token": "string"  // Bearer Token
+}
+```
+
+### 3.2 终端会话（Terminal over WebSocket）
+
+**API 端点：**
+```
+POST /api/devices/peer-connections/{connId}/terminal              — 创建终端
+GET  /api/devices/peer-connections/{connId}/terminals             — 列出终端
+POST /api/devices/peer-connections/{connId}/terminal/{termId}/input   — 输入
+GET  /api/devices/peer-connections/{connId}/terminal/{termId}/read    — 读取输出
+POST /api/devices/peer-connections/{connId}/terminal/{termId}/resize  — 调整大小
+POST /api/devices/peer-connections/{connId}/terminal/{termId}/close   — 关闭终端
+```
+
+**终端协议：**
+- 基于 WebSocket 的双向通信
+- 支持 shell 指定
+- 支持 resize（终端大小调整）
+- 支持多终端并发
+
+### 3.3 远程命令执行
+
+**API 端点：**
+```
+POST /api/devices/peer-connections/{connId}/exec
+```
+
+**请求格式：**
+```json
+{
+  "args": "string",  // 命令参数数组
+  "cwd": "string"    // 工作目录
+}
+```
+
+**特点：**
+- 使用 command + args 数组，避免 shell 字符串注入
+- 无 shell 字符串执行，更安全
+
+### 3.4 文件传输
+
+**API 端点：**
+```
+POST /api/devices/peer-connections/{connId}/upload   — 上传文件
+POST /api/devices/peer-connections/{connId}/download — 下载文件
+```
+
+---
+
+## 四、Relay ↔ Connector 协议（云中继）
+
+### 4.1 协议概述
+
+当设备无法直接连接时（NAT/防火墙后），通过**云中继服务**建立连接：
+
+```
+Gateway (Python)  ←——WebSocket——→  Connector (Node/TypeScript)
+                                         ↑
+                                    Relay Bus (Redis pub/sub)
+                                         ↓
+                                    Platform (Discord/Telegram/...)
+```
+
+### 4.2 帧协议（Frame Protocol）
+
+**传输格式：** 换行分隔的 JSON（newline-delimited JSON）
+
+**帧类型：**
+
+| 方向 | 帧类型 | 说明 |
+|------|--------|------|
+| Gateway → Connector | `hello` | 握手初始化 |
+| Gateway → Connector | `outbound` | 发送消息/编辑/输入 |
+| Gateway → Connector | `interrupt` | 中断当前会话 |
+| Connector → Gateway | `descriptor` | 能力描述符 |
+| Connector → Gateway | `inbound` | 入站消息事件 |
+| Connector → Gateway | `outbound_result` | 出站操作结果 |
+| Connector → Gateway | `interrupt_inbound` | 中断入站 |
+
+**帧结构示例：**
+```json
+// hello
+{"type": "hello", "platform": "discord", "botId": "123456"}
+
+// descriptor
+{"type": "descriptor", "descriptor": {"contract_version": 1, "platform": "discord", ...}}
+
+// inbound
+{"type": "inbound", "event": {...MessageEvent...}, "bufferId": "optional"}
+
+// outbound
+{"type": "outbound", "requestId": "uuid", "action": {"op": "send", "chat_id": "...", "content": "..."}}
+
+// outbound_result
+{"type": "outbound_result", "requestId": "uuid", "result": {"success": true, "message_id": "..."}}
+```
+
+### 4.3 安全认证（HMAC-SHA256）
+
+**WS 升级认证（Gateway → Connector）：**
+```
+Authorization: Bearer <token>
+token = base64url("{gateway_id}:{exp}:{sig}")
+sig = HMAC-SHA256("{gateway_id}:{exp}", secret).hexdigest()
+```
+
+**入站签名（Connector → Gateway）：**
+```
+x-relay-timestamp: <unix_timestamp>
+x-relay-signature: <hex_sig>
+sig = HMAC-SHA256("{ts}.{body_json}", delivery_key).hexdigest()
+```
+
+**安全特性：**
+- 多密钥验证列表（支持密钥轮换）
+- 重放窗口检查（默认 ±300 秒）
+- 恒定时间比较（防时序攻击）
+- 未授权关闭码：4401（私有使用码）
+
+### 4.4 能力描述符（CapabilityDescriptor）
+
+握手时交换的能力协商：
+
+```json
+{
+  "contract_version": 1,
+  "platform": "discord",
+  "label": "My Discord Bot",
+  "max_message_length": 2000,
+  "supports_draft_streaming": true,
+  "supports_edit": true,
+  "supports_threads": true,
+  "markdown_dialect": "discord",
+  "len_unit": "chars",
+  "emoji": "🔌",
+  "platform_hint": "",
+  "pii_safe": false,
+  "supports_context": true,
+  "supported_ops": ["send", "edit", "typing", "follow_up", "get_chat_info"]
+}
+```
+
+### 4.5 出站操作集
+
+| 操作 | 说明 |
+|------|------|
+| `send` | 发送消息 |
+| `edit` | 编辑消息 |
+| `typing` | 输入指示器 |
+| `follow_up` | 共享身份后续操作 |
+| `send_media` | 发送媒体（引用方式） |
+| `prompt` | 交互式提示（按钮/选择器） |
+| `react` | 表情反应 |
+| `thread_create` | 创建线程 |
+| `thread_rename` | 重命名线程 |
+| `get_chat_info` | 获取聊天信息 |
+
+### 4.6 扩展能力
+
+**Phase 1.5 — 多身份：**
+- 单个 WebSocket 支持多个 (platform, bot_id) 身份
+- `hello` 帧发送多个身份声明
+
+**Phase 2 — 媒体传输：**
+- 媒体通过引用传输（URL 或 connector re-host）
+- 支持 25MB 大小限制
+- 入站媒体自动 re-host 到 connector
+
+**Phase 3 — 交互式提示：**
+- Discord 按钮组件
+- Telegram 内联键盘
+- Slack Block Kit
+- WhatsApp 按钮/列表消息
+
+**Phase 4 — 线程生命周期：**
+- 自动线程创建/重命名
+- 语义化 LLM 标题生成
+
+**Phase 5 — 直通平面（Passthrough）：**
+- Discord 交互 → WebSocket 转发
+- 缓冲 + 重连后重放
+- 无需公共入站端口
+
+**Phase 7 — 多租户：**
+- 按用户路由（author-first resolution）
+- 账户链接（/link 命令）
+- 实例绑定（user_instance_binding）
+
+---
+
+## 五、App Connections 协议（移动端）
+
+### 5.1 API 端点
+
+```
+GET  /api/app-connections                              — 列出连接
+POST /api/app-connections/authorization-codes/cloud   — 创建云授权码
+POST /api/app-connections/authorization-codes/lan     — 创建 LAN 授权码
+DELETE /api/app-connections/{id}                       — 删除连接
+```
+
+### 5.2 授权流程
+
+1. Web UI 生成授权码（cloud 或 lan 模式）
+2. 移动端 App 输入授权码
+3. 双方通过 ECDH 协商密钥
+4. 建立加密通信通道
+
+---
+
+## 六、WebSocket Terminal 协议
+
+### 6.1 连接
+
+```
+GET /api/hermes/terminal  — WebSocket 终端连接
+```
+
+### 6.2 特性
+
+- 全双工通信
+- 支持 shell 指定
+- 支持终端 resize
+- 支持多会话
+
+---
+
+## 七、Chat Run HTTP/Socket.IO Bridge
+
+### 6.1 API 端点
+
+```
+POST /api/chat-run/runs  — 启动聊天/编码代理运行
+```
+
+### 6.2 请求参数
+
+```json
+{
+  "input": "string | array",
+  "session_id": "string",
+  "profile": "string",
+  "provider": "string",
+  "model": "string",
+  "source": "cli | coding_agent | global_agent",
+  "instructions": "string",
+  "workspace": "string",
+  "reasoning_effort": "string",
+  "timeout_ms": 300000,
+  "include_events": true
+}
+```
+
+### 6.3 传输模式
+
+- **HTTP 模式**：同步请求-响应
+- **Socket.IO 模式**：实时事件流
+  - `run.started`
+  - `run.progress`
+  - `run.completed`
+  - `run.failed`
+
+---
+
+## 八、协议安全总结
+
+| 安全层 | 机制 | 说明 |
+|--------|------|------|
+| 传输安全 | TLS (wss://) | 所有 WebSocket 连接 |
+| 认证 | HMAC-SHA256 Bearer Token | WS 升级时验证 |
+| 签名 | HMAC-SHA256 | 入站消息签名验证 |
+| 密钥交换 | ECDH | 设备配对时协商 |
+| 数据加密 | AES-128-GCM | 配对后数据加密 |
+| 防重放 | Nonce + 时间戳 | 每次请求唯一 |
+| 密钥轮换 | 多密钥验证列表 | 支持无缝轮换 |
+| 撤销 | 4401 关闭码 | 即时撤销访问权限 |
+
+---
+
+## 九、源码参考
+
+| 模块 | 路径 | 说明 |
+|------|------|------|
+| 配对系统 | `gateway/pairing.py` | DM 配对码管理 |
+| Relay 传输 | `gateway/relay/ws_transport.py` | WebSocket 中继传输 |
+| Relay 协议 | `gateway/relay/transport.py` | 传输协议接口 |
+| 能力描述符 | `gateway/relay/descriptor.py` | 握手能力协商 |
+| 认证原语 | `gateway/relay/auth.py` | HMAC-SHA256 签名 |
+| 适配器 | `gateway/relay/adapter.py` | 平台抽象适配器 |
+| 协议文档 | `docs/relay-connector-contract.md` | 完整协议规范 |
+
+---
+
+## 十、研究结论
+
+1. **协议分层清晰**：从设备发现、配对、连接到应用层操作，每层职责明确
+2. **安全设计完善**：采用业界标准（HMAC-SHA256、ECDH、AES-GCM），支持密钥轮换
+3. **扩展性强**：通过 CapabilityDescriptor 实现能力协商，支持多平台
+4. **生产就绪**：支持多租户、缓冲重连、scale-to-zero 等生产特性
+5. **文档完善**：有专门的 `relay-connector-contract.md` 规范文档
+
+---
+
+*报告生成时间：2026-08-28*
+*数据来源：Hermes Agent v0.6.44 源码 + Hermes Studio API*
