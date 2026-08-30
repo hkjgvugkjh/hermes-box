@@ -1,0 +1,179 @@
+================================================================================
+Hermes Studio 设备管理页面研究
+================================================================================
+日期: 2026-08-30
+研究目标: 为什么 "设备互联" → "小方盒" 页面看不到 T5 设备
+================================================================================
+
+## 一、问题现象
+
+在 Hermes Studio Web UI 中：
+- 导航到 "设备互联" → "小方盒" 标签
+- 显示 "0 台设备" 和 "暂无设备"
+- 已连接并正常工作的 T5 设备（IP: 10.10.168.121）不显示在列表中
+
+## 二、根因分析
+
+### 2.1 Hermes Studio 设备发现协议
+
+Hermes Studio 使用 **UDP 广播** 在局域网中发现其他设备：
+
+| 参数 | 值 |
+|------|-----|
+| 发现端口 (目标) | 48640 (`kHermesDiscoveryPort`) |
+| 本地监听端口 | 48630 (`kLanDiscoveryLocalPort`) |
+| 发现消息类型 | `hermes.discover` |
+| 设备响应类型 | `hermes.announce` |
+| 发现超时 | 1200ms (`kLanDiscoveryTimeoutMs`) |
+| 设备过期时间 | 30000ms (`kLanDiscoveryStaleMs`) |
+
+### 2.2 发现流程
+
+```
+┌─────────────────┐                    ┌─────────────────┐
+│  Hermes Studio  │                    │    T5 设备      │
+│  (网关)         │                    │  (10.10.168.121)│
+└────────┬────────┘                    └────────┬────────┘
+         │                                      │
+         │  UDP Broadcast                       │
+         │  255.255.255.255:48640               │
+         │  {"type":"hermes.discover",           │
+         │   "version":1,                        │
+         │   "request_id":"..."}                 │
+         │─────────────────────────────────────>│
+         │                                      │
+         │  UDP Response                        │
+         │  {"type":"hermes.announce",           │
+         │   "version":1,                        │
+         │   "device_id":"...",                  │
+         │   "computer_name":"...",              │
+         │   "http_port":8648,                   │
+         │   "hermes_web_ui_version":"...",      │
+         │   "hermes_agent_version":"...",       │
+         │   "relay_url":"..."}                  │
+         │<─────────────────────────────────────│
+         │                                      │
+         │  设备加入 lanDevices[] 列表           │
+         │  显示在 "小方盒" 页面                 │
+```
+
+### 2.3 T5 固件的问题
+
+T5 固件 **没有实现 UDP 设备发现协议**：
+
+1. **只实现了网关发现**：T5 使用 mDNS 或 IP 扫描找到 Hermes Studio 网关
+2. **没有实现设备被发现**：T5 不监听 UDP 48630 端口，不响应 `hermes.discover` 广播
+3. **结果**：T5 能主动连接网关，但网关无法发现 T5
+
+### 2.4 API 验证
+
+调用 `hermes_studio_lan_devices_scan` 结果：
+```json
+{
+  "scanning": false,
+  "last_scanned_at": "2026-08-30T01:50:15.202Z",
+  "devices": [
+    {
+      "id": "hwui_4u-u2-WAuyEDWNkp4JGgCq3oosF4w__I",
+      "ip": "10.10.164.77",
+      "http_port": 8648,
+      "endpoint_kind": "web",
+      "computer_name": "tomac-MS-7B89",
+      "online": true
+    }
+  ],
+  "requests": []
+}
+```
+
+只发现了本机（运行 Hermes Studio 的机器），**没有发现 T5 设备**。
+
+## 三、什么情况下才会看到设备？
+
+### 方案 1：实现 UDP 设备发现（推荐）
+
+设备必须：
+1. 监听 UDP 端口 48630
+2. 收到 `hermes.discover` 广播后，响应 `hermes.announce`
+3. 响应内容必须包含以下字段：
+   - `type`: `"hermes.announce"`
+   - `version`: `1`
+   - `device_id`: 设备唯一 ID
+   - `computer_name`: 设备名称
+   - `http_port`: HTTP 服务端口
+   - `hermes_web_ui_version`: Web UI 版本
+   - `hermes_agent_version`: Agent 版本
+   - `relay_url`: 中继 URL（可选）
+
+### 方案 2：配对请求
+
+设备可以：
+1. 主动向网关发送配对请求
+2. 网关显示在 "申请列表" 中
+3. 用户点击 "批准" 后设备可见
+
+### 方案 3：远程配对
+
+1. 使用远程配对链接
+2. 通过 Hermes Studio 的远程访问服务
+3. 适用于不在同一局域网的设备
+
+## 四、官方固件实现参考
+
+在 `hermes_official_main.cpp` 中：
+
+```cpp
+// 发现端口定义
+constexpr uint16_t kLanDiscoveryLocalPort = 48630;
+constexpr uint16_t kHermesDiscoveryPort = 48640;
+constexpr uint32_t kLanDiscoveryTimeoutMs = 1200;
+constexpr uint32_t kLanDiscoveryStaleMs = 30000;
+
+// 发送发现包
+void sendLanDiscoveryPacket(const IPAddress &target, const String &requestId) {
+  String packet = "{\"type\":\"hermes.discover\",\"version\":1,\"request_id\":\"" + requestId + "\"}";
+  lanUdp.beginPacket(target, kHermesDiscoveryPort);
+  lanUdp.print(packet);
+  lanUdp.endPacket();
+}
+
+// 扫描 LAN 设备
+void scanLanDevices() {
+  // 监听 48630 端口
+  lanUdpReady = lanUdp.begin(kLanDiscoveryLocalPort);
+  
+  // 发送广播到 255.255.255.255:48640
+  sendLanDiscoveryPacket(IPAddress(255, 255, 255, 255), requestId);
+  
+  // 等待响应
+  while (millis() - started < kLanDiscoveryTimeoutMs) {
+    int packetSize = lanUdp.parsePacket();
+    if (packetSize > 0) {
+      // 读取响应
+      char buffer[1600];
+      int len = lanUdp.read(buffer, sizeof(buffer) - 1);
+      String json(buffer);
+      // 验证 request_id 匹配
+      if (jsonStringValue(json, "request_id") != requestId) continue;
+      // 保存设备信息
+      rememberLanDevice(json, lanUdp.remoteIP(), millis() - started);
+    }
+  }
+}
+```
+
+## 五、结论
+
+**T5 设备不显示在 "小方盒" 页面的根本原因是：**
+
+T5 固件没有实现 Hermes Studio 的 UDP 设备发现协议（`hermes.discover` / `hermes.announce`）。T5 只能作为客户端主动连接网关，但无法作为设备被网关发现。
+
+**解决方案：**
+
+为 T5 固件添加 UDP 设备发现响应功能：
+1. 在 `setup()` 中初始化 UDP 监听端口 48630
+2. 在 `loop()` 中检查 UDP 数据包
+3. 收到 `hermes.discover` 后，构建并发送 `hermes.announce` 响应
+4. 响应中包含设备 ID、名称、HTTP 端口、版本信息等
+
+================================================================================
